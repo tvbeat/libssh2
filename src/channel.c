@@ -1873,10 +1873,19 @@ _libssh2_channel_receive_window_adjust(LIBSSH2_CHANNEL * channel,
 {
     int rc;
 
+    /* TODO: Shouldn't this be done at the end, because docs state we return
+       the new window size? */
     if(store)
         *store = channel->remote.window_size;
 
+    /* Don't overflow channel->remote.window_size. */
+    if(adjustment > UINT32_MAX - channel->remote.window_size)
+        adjustment = UINT32_MAX - channel->remote.window_size;
+
     if(channel->adjust_state == libssh2_NB_state_idle) {
+        /* Handle adjustment overflow when applying adjust_queue. */
+        if(adjustment > UINT32_MAX - channel->adjust_queue)
+            adjustment = UINT32_MAX - channel->adjust_queue;
         if(!force
             && (adjustment + channel->adjust_queue <
                 LIBSSH2_CHANNEL_MINADJUST)) {
@@ -1894,6 +1903,10 @@ _libssh2_channel_receive_window_adjust(LIBSSH2_CHANNEL * channel,
 
         adjustment += channel->adjust_queue;
         channel->adjust_queue = 0;
+
+        /* Don't overflow channel->remote.window_size. */
+        if(adjustment > UINT32_MAX - channel->remote.window_size)
+            adjustment = UINT32_MAX - channel->remote.window_size;
 
         /* Adjust the window based on the block we just freed */
         channel->adjust_adjust[0] = SSH_MSG_CHANNEL_WINDOW_ADJUST;
@@ -1953,6 +1966,9 @@ libssh2_channel_receive_window_adjust(LIBSSH2_CHANNEL *channel,
     if(!channel)
         return (unsigned long)LIBSSH2_ERROR_BAD_USE;
 
+    if(adj > UINT32_MAX)
+        adj = UINT32_MAX;
+
     BLOCK_ADJUST(rc, channel->session,
                  _libssh2_channel_receive_window_adjust(channel,
                                                         (uint32_t)adj,
@@ -1984,6 +2000,9 @@ libssh2_channel_receive_window_adjust2(LIBSSH2_CHANNEL *channel,
 
     if(!channel)
         return LIBSSH2_ERROR_BAD_USE;
+
+    if(adj > UINT32_MAX)
+        adj = UINT32_MAX;
 
     BLOCK_ADJUST(rc, channel->session,
                  _libssh2_channel_receive_window_adjust(channel,
@@ -2078,20 +2097,35 @@ ssize_t _libssh2_channel_read(LIBSSH2_CHANNEL *channel, int stream_id,
     int unlink_packet;
     LIBSSH2_PACKET *read_packet;
     LIBSSH2_PACKET *read_next;
+    uint32_t window_size_magic;
 
     _libssh2_debug((session, LIBSSH2_TRACE_CONN,
-                   "channel_read() wants %d bytes from channel %lu/%lu "
+                   "channel_read() wants %lu bytes from channel %lu/%lu "
                    "stream #%d",
-                   (int) buflen, channel->local.id, channel->remote.id,
+                   buflen, channel->local.id, channel->remote.id,
                    stream_id));
+
+    /* Receive window is uin32_t, so we never read more than 4GB at once. */
+    if(buflen > UINT32_MAX)
+        buflen = UINT32_MAX;
+
+    /* What is this magic 3/4 multiplication? */
+    window_size_magic = channel->remote.window_size_initial / 4 * 3;
+    if(buflen > UINT32_MAX - window_size_magic)
+        window_size_magic = UINT32_MAX;
+    else
+        window_size_magic += (uint32_t)buflen;
 
     /* expand the receiving window first if it has become too narrow */
     if((channel->read_state == libssh2_NB_state_jump1) ||
-       (channel->remote.window_size <
-        channel->remote.window_size_initial / 4 * 3 + buflen)) {
+       (channel->remote.window_size < window_size_magic)) {
 
-        uint32_t adjustment = (uint32_t)(channel->remote.window_size_initial +
-            buflen - channel->remote.window_size);
+        uint32_t adjustment;
+        if(buflen > UINT32_MAX - channel->remote.window_size_initial)
+            adjustment = UINT32_MAX;
+        else
+            adjustment = (uint32_t)buflen + channel->remote.window_size_initial;
+        adjustment -= channel->remote.window_size;
         if(adjustment < LIBSSH2_CHANNEL_MINADJUST)
             adjustment = LIBSSH2_CHANNEL_MINADJUST;
 
@@ -2219,6 +2253,9 @@ ssize_t _libssh2_channel_read(LIBSSH2_CHANNEL *channel, int stream_id,
     }
 
     channel->read_avail -= bytes_read;
+    /* We limited buflen to UINT32_MAX */
+    assert(bytes_read <= UINT32_MAX);
+    assert(channel->remote.window_size >= bytes_read);
     channel->remote.window_size -= (uint32_t)bytes_read;
 
     return bytes_read;
@@ -2249,6 +2286,10 @@ libssh2_channel_read_ex(LIBSSH2_CHANNEL *channel, int stream_id, char *buf,
         return LIBSSH2_ERROR_BAD_USE;
 
     recv_window = libssh2_channel_window_read_ex(channel, NULL, NULL);
+
+    /* Receive window is uin32_t, so we never read more than 4GB at once. */
+    if(buflen > UINT32_MAX)
+        buflen = UINT32_MAX;
 
     if(buflen > recv_window) {
         BLOCK_ADJUST(rc, channel->session,
